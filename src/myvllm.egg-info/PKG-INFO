@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: myvllm
+Version: 0.1.0
+Summary: A custom vLLM project
+Requires-Python: <3.12,>=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: transformers
+Requires-Dist: torch
+Requires-Dist: xxhash
+Requires-Dist: vllm>=0.15.0
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: isort; extra == "dev"

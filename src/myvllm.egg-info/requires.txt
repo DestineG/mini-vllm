@@ -1,0 +1,9 @@
+transformers
+torch
+xxhash
+vllm>=0.15.0
+
+[dev]
+pytest
+black
+isort
