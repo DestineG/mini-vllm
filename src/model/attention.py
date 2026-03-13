@@ -122,7 +122,7 @@ def flash_attention_varlen_kernel(
     Q = tl.load(Q_ptr, mask=Q_mask[:, None], other=0.0)
 
     row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-    row_max = tl.full([BLOCK_M], dtype=tl.float32) - 1e10
+    row_max = tl.full([BLOCK_M], -1e10, dtype=tl.float32)
     block_result = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
 
     # 计算 KV block 数量
@@ -139,11 +139,11 @@ def flash_attention_varlen_kernel(
         KV_mask = KV_block_range < seq_len  # (BLOCK_N,)
         # KV_block_range 作为列， head_dim_range 作为行，读取 K, shape=(head_dim, BLOCK_N)
         K_ptr = K + (seq_start + KV_block_range[None, :]) * num_kv_heads * head_dim + KV_head_idx * head_dim + head_dim_range[:, None]
-        K = tl.load(K_ptr, mask=KV_mask[None, :], other=0.0)
+        K_tile = tl.load(K_ptr, mask=KV_mask[None, :], other=0.0)
 
         # Q@K^T, size=(BLOCK_M, head_dim)@(head_dim, BLOCK_N)=>(BLOCK_M, BLOCK_N)
         # Q@K^T, size=(BLOCK_M, head_dim)@(head_dim, valid_BLOCK_N)=>(BLOCK_M, valid_BLOCK_N)
-        qk = tl.dot(Q, K)
+        qk = tl.dot(Q, K_tile)
         qk = qk * scale
 
         # casual mask
@@ -162,11 +162,11 @@ def flash_attention_varlen_kernel(
         p = tl.exp(qk - row_max_new[:, None])
 
         # V block 读取方式同 K
-        V_ptr = V + (seq_start + KV_block_range[None, :]) * num_kv_heads * head_dim + KV_head_idx * head_dim + head_dim_range[:, None]
-        V = tl.load(V_ptr, mask=KV_mask[None, :], other=0.0)
+        V_ptr = V + (seq_start + KV_block_range[:, None]) * num_kv_heads * head_dim + KV_head_idx * head_dim + head_dim_range[None, :]
+        V_tile = tl.load(V_ptr, mask=KV_mask[:, None], other=0.0)
 
         # 计算 qkv
-        block_result = block_result + tl.dot(p.to(V.dtype), V)
+        block_result = block_result + tl.dot(p.to(V_tile.dtype), V_tile)
 
         # 更新 onlinesoftmax 参数
         row_sum = row_sum * alpha + tl.sum(p, axis=1)   # 历史 row_sum 修正 + 当前 的 p.sum
@@ -189,7 +189,7 @@ def flash_attention_prefill(
     num_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    
+    cu_seqlens = cu_seqlens.to(q.device)
     # 确保输入张量是 row 连续
     q = q.contiguous()
     k = k.contiguous()
@@ -284,7 +284,7 @@ def paged_attention_decode_kernel(
         # 处理序列填不满当前 BLOCK_N 的情况
         KV_mask = KV_block_range < context_len  # (BLOCK_N,)
 
-        qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
+        qk = tl.full([BLOCK_M, BLOCK_N], -1e10, dtype=tl.float32)
         # 遍历 K_block 每一个 token
         for i in range(BLOCK_N):
             K_token_idx = KV_block_start + i
@@ -401,7 +401,7 @@ def paged_attention_decode(
 
     return output
 
-class Attntion(torch.nn.Module):
+class Attention(torch.nn.Module):
     def __init__(self,
         num_heads: int,
         head_dim: int,
@@ -419,7 +419,7 @@ class Attntion(torch.nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
-        k_cache, v_cache = self.k_cache = self.v_cache
+        k_cache, v_cache = self.k_cache, self.v_cache
 
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
             if k.dim() == 4:
@@ -432,8 +432,7 @@ class Attntion(torch.nn.Module):
                 v_to_store = v.contiguous()
             store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
 
-        scale = self.scale / (self.head_dim ** 0.5)
-
+        scale = self.scale
         if context.is_prefill:
             cu_seqlens = context.cu_seqlens_q
             if cu_seqlens is None:
@@ -442,6 +441,7 @@ class Attntion(torch.nn.Module):
             o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
                                         self.num_heads, self.num_kv_heads, self.head_dim)
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
+            # print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@o shape:", o.shape)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
             o = paged_attention_decode(

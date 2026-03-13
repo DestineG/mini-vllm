@@ -4,8 +4,8 @@ import torch
 
 @dataclass
 class Context:
-    is_prefill: bool = False
-    cu_seqlens_q: torch.Tensor | None = None
+    is_prefill: bool = True
+    cu_seqlens_q: torch.Tensor | None = torch.tensor([0,256,2*256])
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
